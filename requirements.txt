@@ -1,7 +1,8 @@
 streamlit
-google-generativeai
+google-genai
 pdfplumber
 PyPDF2
 python-dotenv
 pandas
 numpy
+ollama
