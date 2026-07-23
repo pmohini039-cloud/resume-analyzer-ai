@@ -1,7 +1,7 @@
 import json
 import os
 import re
-from google import genai
+import google.genai as genai
 import ollama
 import streamlit as st
 
