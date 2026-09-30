@@ -5,23 +5,30 @@ import time
 import requests
 import streamlit as st
 from google import genai
+from google.genai import errors
 
 # Initialize Gemini Client (reads GEMINI_API_KEY from environment/secrets)
-client = genai.Client()
+api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        pass
+
+client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 
 def ask_llm(
-    prompt: str, model: str = "gemini-3.6-flash", max_retries: int = 3
+    prompt: str, model: str = "gemini-2.0-flash", max_retries: int = 3
 ) -> str:
-    """Routes requests to either Google Gemini API or local Ollama depending on selected model."""
+    """Routes requests to either Google Gemini API or local Ollama depending on selected model,
+    including automatic multi-model fallbacks for Gemini rate limits (429) and outages (503)."""
+    
     # Strip extra labels (e.g., "llama3.2:3b (Local)" -> "llama3.2:3b")
     clean_model = model.split(" ")[0].strip()
-
-    # Normalize gemini models if older strings are passed
-    if "2.5-flash" in clean_model or "1.5-flash" in clean_model:
-        clean_model = "gemini-3.6-flash"
 
     # --- 1. LOCAL OLLAMA MODELS ---
     if "llama" in clean_model.lower() or "gemma" in clean_model.lower():
@@ -42,42 +49,60 @@ def ask_llm(
         except Exception as e:
             raise RuntimeError(f"Ollama execution error ({clean_model}): {e}") from e
 
-    # --- 2. GOOGLE GEMINI MODELS ---
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=clean_model,
-                contents=prompt,
-            )
-            if response and response.text:
-                return response.text
+    # --- 2. GOOGLE GEMINI MODELS (WITH FALLBACK CHAIN) ---
+    # Build model attempt list starting with the requested model followed by stable alternatives
+    models_to_try = [clean_model]
+    fallback_chain = ["gemini-2.0-flash", "gemini-1.5-flash"]
+    
+    for fallback in fallback_chain:
+        if fallback not in models_to_try:
+            models_to_try.append(fallback)
 
-        except Exception as e:
-            error_str = str(e)
-
-            # Handle 429 Rate Limit / Resource Exhausted Quota Errors
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                match = re.search(r"retry in (\d+(\.\d+)?)s", error_str)
-                wait_time = int(float(match.group(1))) + 2 if match else 15
-
-                st.warning(
-                    f"⏳ Rate limit reached for `{clean_model}`. Waiting {wait_time}s before retrying... (Attempt {attempt}/{max_retries})"
+    for current_model in models_to_try:
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = client.models.generate_content(
+                    model=current_model,
+                    contents=prompt,
                 )
-                time.sleep(wait_time)
-                continue
+                if response and response.text:
+                    return response.text
 
-            # Handle 503 Server Unavailable / Temporary Outage
-            elif "503" in error_str or "UNAVAILABLE" in error_str:
-                if attempt < max_retries:
-                    time.sleep(3 * attempt)
-                    continue
+            except Exception as e:
+                error_str = str(e).lower()
 
-            raise RuntimeError(
-                f"Failed to communicate with Gemini API ({clean_model}): {e}"
-            ) from e
+                # Handle transient errors: 429 Rate Limit, 503 Server Unavailable, Quota Errors
+                is_transient = any(
+                    err in error_str
+                    for err in ["429", "503", "resource_exhausted", "unavailable", "quota", "demand"]
+                )
+
+                if is_transient:
+                    match = re.search(r"retry in (\d+(\.\d+)?)s", error_str)
+                    wait_time = int(float(match.group(1))) + 2 if match else (2 * attempt)
+
+                    if attempt < max_retries:
+                        try:
+                            st.warning(
+                                f"⏳ Gemini (`{current_model}`) is busy or rate-limited. Retrying in {wait_time}s... (Attempt {attempt}/{max_retries})"
+                            )
+                        except Exception:
+                            pass
+                        
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        # Retries exhausted for this model, move to the next fallback model in line
+                        break
+                else:
+                    # Raise non-recoverable client/API key errors immediately
+                    raise RuntimeError(
+                        f"Failed to communicate with Gemini API ({current_model}): {e}"
+                    ) from e
 
     raise RuntimeError(
-        f"Gemini API ({clean_model}) quota limit reached. Please wait a minute or switch to another model."
+        f"All Gemini models ({', '.join(models_to_try)}) are currently experiencing high demand or quota limits. "
+        "Please wait 30 seconds and try again."
     )
 
 
@@ -130,14 +155,14 @@ For each question, provide "Solid Answer Guidance" so an interviewer knows what 
 
 
 def analyze_resume(
-    resume_text: str, model: str = "gemini-3.6-flash"
+    resume_text: str, model: str = "gemini-2.0-flash"
 ) -> str:
     """Generates qualitative resume review."""
     return ask_llm(PROMPT.format(resume=resume_text), model)
 
 
 def extract_resume_json(
-    resume_text: str, model: str = "gemini-3.6-flash"
+    resume_text: str, model: str = "gemini-2.0-flash"
 ) -> dict:
     """Extracts candidate profile data as a structured dictionary safely."""
     raw_response = ask_llm(
@@ -173,7 +198,7 @@ def extract_resume_json(
 
 
 def generate_missing_skill_questions(
-    job_role: str, missing_skills: list, model: str = "gemini-3.6-flash"
+    job_role: str, missing_skills: list, model: str = "gemini-2.0-flash"
 ) -> str:
     """Generates targeted technical interview questions based on missing skill gaps."""
     if not missing_skills:
