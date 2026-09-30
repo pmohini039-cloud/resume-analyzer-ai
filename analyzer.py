@@ -5,11 +5,9 @@ import time
 import requests
 import streamlit as st
 from google import genai
-from google.genai import errors
 
-# Initialize Gemini Client (reads GEMINI_API_KEY from environment/secrets)
+# Securely fetch API key
 api_key = os.getenv("GEMINI_API_KEY")
-
 if not api_key:
     try:
         api_key = st.secrets.get("GEMINI_API_KEY")
@@ -17,196 +15,145 @@ if not api_key:
         pass
 
 client = genai.Client(api_key=api_key) if api_key else genai.Client()
-
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
+# Active 2026 model fallback chain
+MODEL_FALLBACK_CHAIN = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+]
 
-def ask_llm(
-    prompt: str, model: str = "gemini-2.0-flash", max_retries: int = 3
-) -> str:
-    """Routes requests to either Google Gemini API or local Ollama depending on selected model,
-    including automatic multi-model fallbacks for Gemini rate limits (429) and outages (503)."""
-    
-    # Strip extra labels (e.g., "llama3.2:3b (Local)" -> "llama3.2:3b")
+def ask_llm(prompt: str, model: str = "gemini-3.8-flash", max_retries: int = 2) -> str:
     clean_model = model.split(" ")[0].strip()
 
-    # --- 1. LOCAL OLLAMA MODELS ---
+    # Map deprecated models automatically
+    if any(old_ver in clean_model for old_ver in ["1.5", "2.0", "2.5", "3.6"]):
+        clean_model = "gemini-3.8-flash"
+
     if "llama" in clean_model.lower() or "gemma" in clean_model.lower():
         try:
-            payload = {
-                "model": clean_model,
-                "prompt": prompt,
-                "stream": False,
-            }
-            response = requests.post(OLLAMA_URL, json=payload, timeout=300)
-            response.raise_for_status()
-            data = response.json()
-            return data.get("response", "")
-        except requests.exceptions.ConnectionError:
-            raise RuntimeError(
-                "Could not connect to local Ollama server. Please ensure Ollama is running on your machine."
-            )
+            payload = {"model": clean_model, "prompt": prompt, "stream": False}
+            res = requests.post(OLLAMA_URL, json=payload, timeout=300)
+            res.raise_for_status()
+            return res.json().get("response", "")
         except Exception as e:
             raise RuntimeError(f"Ollama execution error ({clean_model}): {e}") from e
 
-    # --- 2. GOOGLE GEMINI MODELS (WITH FALLBACK CHAIN) ---
-    # Build model attempt list starting with the requested model followed by stable alternatives
     models_to_try = [clean_model]
-    fallback_chain = ["gemini-2.0-flash", "gemini-1.5-flash"]
-    
-    for fallback in fallback_chain:
-        if fallback not in models_to_try:
-            models_to_try.append(fallback)
+    for fb in MODEL_FALLBACK_CHAIN:
+        if fb not in models_to_try:
+            models_to_try.append(fb)
 
+    last_error = None
     for current_model in models_to_try:
         for attempt in range(1, max_retries + 1):
             try:
                 response = client.models.generate_content(
-                    model=current_model,
-                    contents=prompt,
+                    model=current_model, contents=prompt
                 )
                 if response and response.text:
                     return response.text
-
             except Exception as e:
-                error_str = str(e).lower()
-
-                # Handle transient errors: 429 Rate Limit, 503 Server Unavailable, Quota Errors
-                is_transient = any(
-                    err in error_str
-                    for err in ["429", "503", "resource_exhausted", "unavailable", "quota", "demand"]
-                )
-
-                if is_transient:
-                    match = re.search(r"retry in (\d+(\.\d+)?)s", error_str)
-                    wait_time = int(float(match.group(1))) + 2 if match else (2 * attempt)
-
-                    if attempt < max_retries:
-                        try:
-                            st.warning(
-                                f"⏳ Gemini (`{current_model}`) is busy or rate-limited. Retrying in {wait_time}s... (Attempt {attempt}/{max_retries})"
-                            )
-                        except Exception:
-                            pass
-                        
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        # Retries exhausted for this model, move to the next fallback model in line
+                last_error = e
+                err_str = str(e).lower()
+                if any(k in err_str for k in ["429", "503", "resource_exhausted", "quota"]):
+                    if attempt == max_retries:
                         break
+                    time.sleep(2 * attempt)
+                    continue
                 else:
-                    # Raise non-recoverable client/API key errors immediately
-                    raise RuntimeError(
-                        f"Failed to communicate with Gemini API ({current_model}): {e}"
-                    ) from e
+                    raise RuntimeError(f"API Error ({current_model}): {e}") from e
 
-    raise RuntimeError(
-        f"All Gemini models ({', '.join(models_to_try)}) are currently experiencing high demand or quota limits. "
-        "Please wait 30 seconds and try again."
-    )
+    raise RuntimeError(f"All models failed. Last error: {last_error}")
 
+# --- PROMPTS ---
 
-# --- Prompts ---
-
-PROMPT = """
-You are an expert HR Specialist and Technical Recruiter.
-Analyze the following resume and provide a detailed evaluation.
-
-Resume Text:
-{resume}
-
-Provide your feedback in clear Markdown with the following sections:
-1. Executive Resume Summary
-2. Key Strengths
-3. Critical Weaknesses
-4. Missing High-Impact Skills
-5. Actionable Improvement Suggestions
-6. Suitable Job Roles
-7. 5 Tailored Interview Questions
+GENERATE_JD_PROMPT = """
+You are an expert HR Specialist. Generate a concise, tailored Job Description for the target role: {job_title} ({experience_level} level).
+Return ONLY a structured Markdown job description containing Job Title, Job Summary, and Key Responsibilities.
 """
 
-EXTRACT_JSON_PROMPT = """
-Extract profile data from the resume below into a clean JSON object.
+PARSE_JD_PROMPT = """
+Extract required skills from this Job Description:
+{jd_text}
 
-Resume Text:
-{resume}
-
-Return ONLY valid JSON with this exact structure (no commentary):
+Return ONLY valid JSON with structure:
 {{
-    "name": "Candidate Name",
-    "skills": ["Skill1", "Skill2"],
-    "education": ["Degree - Institution"],
-    "experience": ["Role - Company"],
-    "certifications": ["Cert Name"]
+    "target_role": "Role Name",
+    "required_skills": ["Skill1", "Skill2"]
 }}
 """
 
-QUESTIONS_PROMPT = """
-You are a Senior Technical Interviewer.
-The candidate is applying for the role of: {job_role}
-They are missing the following required technical skills: {missing_skills}
+EVALUATE_MATCH_PROMPT = """
+Compare Candidate Resume against Job Requirements.
 
-Generate 5 high-quality, scenario-based technical interview questions that specifically test or explore these missing skill areas.
-For each question, provide "Solid Answer Guidance" so an interviewer knows what to look for.
+Resume:
+{resume_text}
+
+Job Requirements JSON:
+{jd_json_str}
+
+Return ONLY a JSON object:
+{{
+    "overall_match_score": 85,
+    "skills_alignment_score": 90,
+    "education_alignment_score": 85,
+    "experience_alignment_score": 60,
+    "certifications_alignment_score": "N/A (Not Required)",
+    "summary_bullets": ["✓ Bullet 1", "✓ Bullet 2"],
+    "matched_skills": ["Skill1", "Skill2"],
+    "missing_skills": ["Skill3"],
+    "qualitative_analysis": {{
+        "summary": "Executive summary paragraph...",
+        "strengths": ["Strength 1", "Strength 2"],
+        "weaknesses": ["Weakness 1", "Weakness 2"],
+        "missing_skills_list": ["Missing 1"],
+        "improvements": ["Suggestion 1"],
+        "suitable_roles": ["Role 1"],
+        "interview_questions": ["Question 1", "Question 2"]
+    }}
+}}
 """
 
+REWRITE_RESUME_PROMPT = """
+You are a Professional Resume Writer.
+Rewrite the following resume into a beautifully formatted, ATS-optimized Markdown resume that naturally integrates these missing skills: {missing_skills}.
 
-# --- Core Functions ---
+Resume:
+{resume_text}
 
+Return ONLY the complete Markdown formatted resume.
+"""
 
-def analyze_resume(
-    resume_text: str, model: str = "gemini-2.0-flash"
-) -> str:
-    """Generates qualitative resume review."""
-    return ask_llm(PROMPT.format(resume=resume_text), model)
+QUESTIONS_PROMPT = """
+Generate 5 targeted, high-quality technical interview questions for role: {job_role} based on missing skills: {missing_skills}.
+"""
 
+# --- CORE WRAPPER FUNCTIONS ---
 
-def extract_resume_json(
-    resume_text: str, model: str = "gemini-2.0-flash"
-) -> dict:
-    """Extracts candidate profile data as a structured dictionary safely."""
-    raw_response = ask_llm(
-        EXTRACT_JSON_PROMPT.format(resume=resume_text), model
-    )
+def generate_jd(job_title: str, level: str, model: str = "gemini-3.8-flash") -> str:
+    return ask_llm(GENERATE_JD_PROMPT.format(job_title=job_title, experience_level=level), model)
 
-    if not raw_response or not isinstance(raw_response, str):
-        return {
-            "name": "Candidate",
-            "skills": [],
-            "education": [],
-            "experience": [],
-            "certifications": [],
-        }
+def evaluate_candidate(resume_text: str, jd_text: str, model: str = "gemini-3.8-flash") -> dict:
+    jd_json_raw = ask_llm(PARSE_JD_PROMPT.format(jd_text=jd_text), model)
+    eval_raw = ask_llm(EVALUATE_MATCH_PROMPT.format(resume_text=resume_text, jd_json_str=jd_json_raw), model)
+    
+    try:
+        jd_match = re.search(r"\{[\s\S]*\}", jd_json_raw)
+        eval_match = re.search(r"\{[\s\S]*\}", eval_raw)
+        
+        parsed_jd = json.loads(jd_match.group()) if jd_match else {}
+        parsed_eval = json.loads(eval_match.group()) if eval_match else {}
+        
+        return {"parsed_jd": parsed_jd, "evaluation": parsed_eval}
+    except Exception:
+        return {"parsed_jd": {}, "evaluation": {}}
 
-    match = re.search(r"\{[\s\S]*\}", raw_response)
-    if match:
-        try:
-            cleaned_json = (
-                match.group().replace("```json", "").replace("```", "")
-            )
-            return json.loads(cleaned_json)
-        except json.JSONDecodeError:
-            pass
+def rewrite_resume(resume_text: str, missing_skills: list, model: str = "gemini-3.8-flash") -> str:
+    skills_str = ", ".join(missing_skills) if missing_skills else "N/A"
+    return ask_llm(REWRITE_RESUME_PROMPT.format(resume_text=resume_text, missing_skills=skills_str), model)
 
-    return {
-        "name": "Candidate",
-        "skills": [],
-        "education": [],
-        "experience": [],
-        "certifications": [],
-    }
-
-
-def generate_missing_skill_questions(
-    job_role: str, missing_skills: list, model: str = "gemini-2.0-flash"
-) -> str:
-    """Generates targeted technical interview questions based on missing skill gaps."""
-    if not missing_skills:
-        skills_str = "General core competencies for the role"
-    else:
-        skills_str = ", ".join(missing_skills)
-
-    prompt = QUESTIONS_PROMPT.format(
-        job_role=job_role, missing_skills=skills_str
-    )
-    return ask_llm(prompt, model)
+def generate_missing_skill_questions(job_role: str, missing_skills: list, model: str = "gemini-3.8-flash") -> str:
+    skills_str = ", ".join(missing_skills) if missing_skills else "General technical stack"
+    return ask_llm(QUESTIONS_PROMPT.format(job_role=job_role, missing_skills=skills_str), model)
